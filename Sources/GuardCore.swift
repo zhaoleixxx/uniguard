@@ -76,8 +76,8 @@ final class Guard {
     static let shared = Guard()
 
     private init() {
-        gateway = resolveGateway()
-        loadPersistedProfile()
+        loadPersistedProfile()          // 先载入断线前档位
+        gateway = resolveGateway()      // 再按它解析网关
     }
 
     /// 网关不写死：优先环境变量，其次当前档配置，最后任一档配置

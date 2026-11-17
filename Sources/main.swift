@@ -63,7 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.imagePosition = .imageLeft
 
         let g = Guard.shared
-        g.gateway = readGatewayFromConfig()
+        // 网关由 Guard 按「断线前档位」解析，这里只在完全没解析到时兜底
+        if g.gateway.isEmpty { g.gateway = readGatewayFromConfig() }
         g.onChange = { [weak self] s in DispatchQueue.main.async { self?.render(s) } }
         g.startLoop()
         render(g.probe())
