@@ -125,6 +125,9 @@ final class Guard {
     private(set) var fullRestarts = 0
     private var lastFullRestart = Date.distantPast
     private var lastAuthWarn = Date.distantPast
+    /// 点按钮被系统拒绝（缺自动化权限）时为 true，此后走重启路径而不是反复点
+    private(set) var axBlocked = false
+    private var axRetryAt = Date.distantPast
 
     // 多配置档支持：断线前记住是哪一档，重连时写回客户端配置
     var pinnedProfile = ""
@@ -308,6 +311,12 @@ final class Guard {
                 lastAuthWarn = Date()
                 log("⚠️ 缺少自动化权限：系统设置 → 隐私与安全性 → 自动化，勾选 UniGuard 控制 System Events，否则无法点按钮/读弹窗")
             }
+            // 探测阶段就发现没权限：后续直接跳过 AppleScript，避免每轮白等 20s
+            if !axBlocked {
+                axBlocked = true
+                axRetryAt = Date().addingTimeInterval(300)
+                log("探测阶段确认无自动化权限，暂停调用 AppleScript（5 分钟后重试）")
+            }
             return (0, "", "")
         }
         let parts = raw.components(separatedBy: "§")
@@ -332,7 +341,7 @@ final class Guard {
         s.gatewayIf = gif
         s.staleRoutes = staleRouteScan()
 
-        let ui = clientUI()
+        let ui = axBlocked ? (windows: 0, texts: "", buttons: "") : clientUI()
         s.dialogText = ui.texts
         // 从 AX 文字里取「VPN名称：」后面那一项
         let toks = ui.texts
@@ -374,6 +383,7 @@ final class Guard {
     }
 
     private func clickConnect() -> String {
+        if axBlocked { return "blocked" }
         let s = """
         tell application "System Events"
             if not (exists process "UniVPN") then return "noproc"
@@ -391,7 +401,17 @@ final class Guard {
             end tell
         end tell
         """
-        return Shell.osa(s)
+        let out = Shell.osa(s)
+        if out.contains("不允许辅助访问") || out.contains("execution error") || out.contains("-25211") {
+            if !axBlocked {
+                axBlocked = true
+                axRetryAt = Date().addingTimeInterval(300)
+                log("点按钮被系统拒绝（缺自动化权限）→ 改为重启客户端拉起（5 分钟后重试授权）")
+            }
+        } else if out == "clicked" || out == "connected" {
+            axBlocked = false
+        }
+        return out
     }
 
     private func dismissDialogs() -> String {
@@ -423,7 +443,11 @@ final class Guard {
         restoreProfileBeforeLaunch()
         launchClient()
         usleep(5_000_000)
-        _ = clickConnect()
+        if axBlocked {
+            log("无自动化权限，等客户端自动登录")
+        } else {
+            _ = clickConnect()
+        }
         lastRestart = Date()
         softRestarts += 1
     }
@@ -448,8 +472,12 @@ final class Guard {
         restoreProfileBeforeLaunch()
         launchClient()
         usleep(8_000_000)
-        let r = clickConnect()
-        log("完全重启后点击结果：\(r)")
+        if axBlocked {
+            log("无自动化权限，等客户端自动登录")
+        } else {
+            let r = clickConnect()
+            log("完全重启后点击结果：\(r)")
+        }
         lastRestart = Date()
         lastFullRestart = Date()
         softRestarts = 0
@@ -480,6 +508,8 @@ final class Guard {
             fullRestart("外部触发")
             return
         }
+
+        if axBlocked && Date() >= axRetryAt { axBlocked = false; log("重试自动化权限检测") }
 
         // 网关跟随「断线前档位」动态更新，避免用错档的网关做判断
         let wantGW = resolveGateway()
@@ -543,6 +573,17 @@ final class Guard {
 
         case .dialTimeout:
             streak += 1
+            if axBlocked {
+                // 点不动按钮：客户端重启后会自动登录，直接走这条路
+                if Date().timeIntervalSince(lastRestart) > 30 {
+                    softRestart("无自动化权限，重启客户端拉起")
+                    cooldownUntil = Date().addingTimeInterval(40)
+                    s.note = "已重启客户端（无权限点按钮，等自动登录）"
+                } else {
+                    s.note = "等客户端自动登录"
+                    cooldownUntil = Date().addingTimeInterval(15)
+                }
+            } else {
             let r = clickConnect()
             if r == "connected" {
                 s.note = "客户端已恢复连接"
@@ -567,6 +608,7 @@ final class Guard {
                         cooldownUntil = Date().addingTimeInterval(45)
                     }
                 }
+            }
             }
 
         case .tunnelSilent:
