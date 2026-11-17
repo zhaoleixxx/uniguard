@@ -1,0 +1,594 @@
+import Foundation
+import AppKit
+
+// MARK: - 故障分类
+
+enum Fault: String {
+    case ok            = "正常"
+    case engineDead    = "引擎未运行"
+    case dialTimeout   = "连接未成功"
+    case dialogStuck   = "客户端弹窗阻塞"
+    case staleRoute    = "残留路由挡网关"
+    case tunnelSilent  = "隧道起来了但不通"
+}
+
+struct Snapshot {
+    var fault: Fault = .engineDead
+    var tunName = ""
+    var vip = ""
+    var gateway = ""
+    var gatewayIf = ""
+    var engineAlive = false
+    var gatewayReachable = false
+    var staleRoutes: [String] = []
+    var dialogText = ""
+    var activeProfile = ""
+    var targetProfile = ""
+    var pinnedProfile = ""
+    var attempt = 0
+    var note = ""
+    var lastAction = ""
+}
+
+// MARK: - Shell
+
+enum Shell {
+    @discardableResult
+    static func run(_ path: String, _ args: [String], timeout: TimeInterval = 20) -> (Int32, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        var out = ""
+        let lock = NSLock()
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { return }
+            lock.lock(); out += String(data: d, encoding: .utf8) ?? ""; lock.unlock()
+        }
+        do { try p.run() } catch { pipe.fileHandleForReading.readabilityHandler = nil; return (-1, "") }
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning && Date() < deadline { usleep(20_000) }
+        if p.isRunning { p.terminate() }
+        usleep(30_000)
+        pipe.fileHandleForReading.readabilityHandler = nil
+        lock.lock(); let s = out; lock.unlock()
+        return (p.terminationStatus, s)
+    }
+
+    @discardableResult
+    static func sh(_ c: String, timeout: TimeInterval = 20) -> (Int32, String) {
+        run("/bin/sh", ["-c", c], timeout: timeout)
+    }
+
+    static func osa(_ script: String, timeout: TimeInterval = 15) -> String {
+        let (_, o) = run("/usr/bin/osascript", ["-e", script], timeout: timeout)
+        return o.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - 守护
+
+final class Guard {
+    static let shared = Guard()
+
+    private init() {
+        gateway = resolveGateway()
+    }
+
+    /// 网关不写死：优先环境变量，其次当前档配置，最后任一档配置
+    func resolveGateway() -> String {
+        if let e = ProcessInfo.processInfo.environment["UNIGUARD_GATEWAY"], !e.isEmpty { return e }
+        let files = availableProfiles()
+        guard !files.isEmpty else { return "" }
+        let last = readLastSession()
+        let pick = files.first(where: { $0 == last }) ?? files[0]
+        let path = configDir + "/" + pick
+        guard let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return "" }
+        for line in txt.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.lowercased().hasPrefix("gatewayaddress"), let eq = t.firstIndex(of: "=") {
+                let v = t[t.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                if !v.isEmpty { return v }
+            }
+        }
+        return ""
+    }
+
+    private(set) var snap = Snapshot()
+    var onChange: ((Snapshot) -> Void)?
+
+    var logPath = NSHomeDirectory() + "/Library/Logs/UniGuard.log"
+    var gateway = ""
+    var vipPrefix = "172.16."
+    var interval: TimeInterval = 15
+    var paused = false
+    var cooldownUntil = Date.distantPast
+
+    private var streak = 0
+    private var lastRestart = Date.distantPast
+    private var lastDialogDismiss = Date.distantPast
+    private var lastRouteFixReq = Date.distantPast
+    private var lastActionText = ""
+
+    // 运行记录
+    var startedAt = Date()
+    private(set) var history: [(Date, Fault)] = []
+    private(set) var downCount = 0
+    private(set) var upCount = 0
+    private var lastFault: Fault? = nil
+    private var softRestarts = 0
+    private(set) var fullRestarts = 0
+    private var lastFullRestart = Date.distantPast
+    private var lastAuthWarn = Date.distantPast
+
+    // 多配置档支持：断线前记住是哪一档，重连时写回客户端配置
+    var pinnedProfile = ""
+    private(set) var targetProfile = ""
+    private(set) var activeProfile = ""
+    private var okSince: Date? = nil
+
+    // MARK: 日志
+    func log(_ m: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] \(m)\n"
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+        }
+        if let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+            defer { try? fh.close() }
+            _ = try? fh.seekToEnd()
+            try? fh.write(contentsOf: line.data(using: .utf8) ?? Data())
+        }
+    }
+
+    // MARK: 探测
+
+    private func tunnels() -> [(name: String, ip: String)] {
+        let (_, out) = Shell.run("/sbin/ifconfig", [], timeout: 10)
+        var r: [(String, String)] = []
+        var cur = ""
+        for raw in out.split(separator: "\n") {
+            let l = String(raw)
+            if !l.hasPrefix("\t") && l.contains(": flags=") {
+                cur = String(l.split(separator: ":")[0])
+            } else if l.contains("inet ") {
+                let t = l.split(separator: " ")
+                if t.count >= 2 && cur.hasPrefix("utun") { r.append((cur, String(t[1]))) }
+            }
+        }
+        return r
+    }
+
+    private func engineAlive() -> Bool {
+        let (_, out) = Shell.sh("pgrep -x UniVPNCS", timeout: 6)
+        return !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var sysconfigPath: String { NSHomeDirectory() + "/.UniVPN/sysconfig.ini" }
+    private var configDir: String { NSHomeDirectory() + "/.UniVPN/config" }
+
+    func availableProfiles() -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: configDir)) ?? [])
+            .filter { $0.hasSuffix(".ini") }.sorted()
+    }
+
+    func readLastSession() -> String {
+        guard let s = try? String(contentsOfFile: sysconfigPath, encoding: .utf8) else { return "" }
+        for line in s.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("ClientLastAccessSession"), let eq = t.firstIndex(of: "=") {
+                return t[t.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return ""
+    }
+
+    @discardableResult
+    func setLastSession(_ name: String) -> Bool {
+        guard !name.isEmpty, var txt = try? String(contentsOfFile: sysconfigPath, encoding: .utf8) else { return false }
+        var lines = txt.components(separatedBy: "\n")
+        var hit = false
+        for i in lines.indices where lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("ClientLastAccessSession") {
+            lines[i] = "ClientLastAccessSession = \(name)"
+            hit = true
+        }
+        if !hit { lines.append("ClientLastAccessSession = \(name)") }
+        txt = lines.joined(separator: "\n")
+        do { try txt.write(toFile: sysconfigPath, atomically: true, encoding: .utf8); return true } catch { return false }
+    }
+
+    /// 重启前把目标档写回客户端，确保它连的是断线前那一档
+    private func restoreProfileBeforeLaunch() {
+        var want = pinnedProfile.isEmpty ? targetProfile : pinnedProfile
+        if want.isEmpty {
+            // 还没跑过一次成功探测：直接以客户端记录的「上次会话」为准
+            want = readLastSession()
+            targetProfile = want
+            log("配置档：从客户端记录推断目标 = \(want.isEmpty ? "未知" : want)")
+        }
+        guard !want.isEmpty else { log("配置档：无可用目标，按客户端自己记忆连"); return }
+        let cur = readLastSession()
+        if cur != want {
+            let ok = setLastSession(want)
+            log("配置档：写回 \(want)（原为 \(cur.isEmpty ? "空" : cur)，\(ok ? "成功" : "失败")）")
+        } else {
+            log("配置档：已是 \(want)，无需写回")
+        }
+    }
+
+    private func guiRunning() -> Bool {
+        let (_, out) = Shell.sh("pgrep -x UniVPN", timeout: 6)
+        return !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func routeGet(_ host: String) -> (ifname: String, gw: String) {
+        let (_, out) = Shell.run("/sbin/route", ["-n", "get", host], timeout: 8)
+        var i = "", g = ""
+        for raw in out.split(separator: "\n") {
+            let l = raw.trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix("interface:") { i = l.replacingOccurrences(of: "interface:", with: "").trimmingCharacters(in: .whitespaces) }
+            if l.hasPrefix("gateway:")   { g = l.replacingOccurrences(of: "gateway:", with: "").trimmingCharacters(in: .whitespaces) }
+        }
+        return (i, g)
+    }
+
+    private func staleRouteScan() -> [String] {
+        let live = Set(tunnels().map { $0.name })
+        let (_, out) = Shell.run("/usr/sbin/netstat", ["-rn", "-f", "inet"], timeout: 12)
+        var bad: [String] = []
+        for raw in out.split(separator: "\n") {
+            let t = raw.split(separator: " ", omittingEmptySubsequences: true)
+            guard t.count >= 4 else { continue }
+            let dst = String(t[0])
+            let ifc = String(t[t.count - 1])
+            guard ifc.hasPrefix("utun") else { continue }
+            if !live.contains(ifc) { bad.append("\(dst)->\(ifc)") }
+        }
+        return bad
+    }
+
+    private func tcpReachable(_ host: String, _ port: Int, timeoutSec: Int = 3) -> Bool {
+        let (rc, _) = Shell.sh("nc -z -G \(timeoutSec) -w \(timeoutSec) \(host) \(port)", timeout: Double(timeoutSec + 3))
+        return rc == 0
+    }
+
+    private func clientUI() -> (windows: Int, texts: String, buttons: String) {
+        let s = """
+        tell application "System Events"
+            if not (exists process "UniVPN") then return "NOPROC"
+            tell process "UniVPN"
+                set wc to count of windows
+                set t to ""
+                set b to ""
+                repeat with i from 1 to wc
+                    try
+                        set t to t & "|" & (value of every static text of window i as text)
+                    end try
+                    try
+                        set b to b & "|" & (name of every button of window i as text)
+                    end try
+                end repeat
+                return (wc as text) & "§" & t & "§" & b
+            end tell
+        end tell
+        """
+        let raw = Shell.osa(s, timeout: 20)
+        if raw == "NOPROC" { return (0, "", "") }
+        if raw.contains("不允许辅助访问") || raw.contains("not allowed assistive") || raw.contains("-25211") {
+            if Date().timeIntervalSince(lastAuthWarn) > 600 {
+                lastAuthWarn = Date()
+                log("⚠️ 缺少自动化权限：系统设置 → 隐私与安全性 → 自动化，勾选 UniGuard 控制 System Events，否则无法点按钮/读弹窗")
+            }
+            return (0, "", "")
+        }
+        let parts = raw.components(separatedBy: "§")
+        let wc = Int(parts.first ?? "0") ?? 0
+        let texts = parts.count > 1 ? parts[1] : ""
+        let btns  = parts.count > 2 ? parts[2] : ""
+        return (wc, texts, btns)
+    }
+
+    func probe() -> Snapshot {
+        var s = Snapshot()
+        s.gateway = gateway
+        s.engineAlive = engineAlive()
+
+        let ifs = tunnels()
+        if let hit = ifs.first(where: { $0.ip.hasPrefix(vipPrefix) }) {
+            s.tunName = hit.name
+            s.vip = hit.ip
+        }
+
+        let (gif, _) = routeGet(gateway)
+        s.gatewayIf = gif
+        s.staleRoutes = staleRouteScan()
+
+        let ui = clientUI()
+        s.dialogText = ui.texts
+        // 从 AX 文字里取「VPN名称：」后面那一项
+        let toks = ui.texts
+            .components(separatedBy: CharacterSet(charactersIn: "|,"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if let idx = toks.firstIndex(of: "VPN名称："), idx + 1 < toks.count {
+            s.activeProfile = toks[idx + 1]
+        }
+        s.targetProfile = targetProfile
+        let badDialog = ["超时", "重新启动客户端", "已退出"].first { ui.texts.contains($0) } != nil
+
+        if !s.engineAlive {
+            s.fault = badDialog ? .dialogStuck : .engineDead
+        } else if !s.vip.isEmpty {
+            s.gatewayReachable = tcpReachable(gateway, 1024, timeoutSec: 3)
+            if badDialog { s.fault = .dialogStuck }
+            else if !s.gatewayReachable { s.fault = .tunnelSilent }
+            else { s.fault = .ok }
+        } else if !s.staleRoutes.isEmpty {
+            s.fault = .staleRoute
+        } else if badDialog {
+            s.fault = .dialogStuck
+        } else {
+            s.fault = .dialTimeout
+        }
+        s.attempt = streak
+        s.lastAction = lastActionText
+        return s
+    }
+
+    // MARK: 动作
+
+    private func act(_ d: String) { lastActionText = d; log("动作：\(d)") }
+
+    private func launchClient() {
+        act("启动客户端")
+        Shell.run("/usr/bin/open", ["-a", "UniVPN"], timeout: 10)
+    }
+
+    private func clickConnect() -> String {
+        let s = """
+        tell application "System Events"
+            if not (exists process "UniVPN") then return "noproc"
+            tell process "UniVPN"
+                if (count of windows) is 0 then return "nowin"
+                repeat with i from 1 to (count of windows)
+                    set btns to name of every button of window i
+                    if btns contains "断开连接" then return "connected"
+                    if btns contains "连接" then
+                        click button "连接" of window i
+                        return "clicked"
+                    end if
+                end repeat
+                return "nobtn"
+            end tell
+        end tell
+        """
+        return Shell.osa(s)
+    }
+
+    private func dismissDialogs() -> String {
+        let s = """
+        tell application "System Events"
+            if not (exists process "UniVPN") then return "noproc"
+            tell process "UniVPN"
+                set n to 0
+                repeat with i from 1 to (count of windows)
+                    try
+                        set btns to name of every button of window i
+                        if btns contains "确定" then
+                            click button "确定" of window i
+                            set n to n + 1
+                        end if
+                    end try
+                end repeat
+                return (n as text)
+            end tell
+        end tell
+        """
+        return Shell.osa(s)
+    }
+
+    /// 二级：只杀 GUI，引擎随之退出，然后重开
+    func softRestart(_ reason: String) {
+        act("重启客户端（\(reason)）")
+        _ = Shell.sh("killall -9 UniVPN 2>/dev/null; sleep 2", timeout: 12)
+        restoreProfileBeforeLaunch()
+        launchClient()
+        usleep(5_000_000)
+        _ = clickConnect()
+        lastRestart = Date()
+        softRestarts += 1
+    }
+
+    /// 三级·终极兜底：完全退出 UniVPN（含引擎与提升服务）、清残留路由、再重新启动
+    func fullRestart(_ reason: String) {
+        act("终极兜底：完全退出并重启（\(reason)）")
+        // ① 先走优雅退出
+        _ = Shell.osa("tell application \"UniVPN\" to quit", timeout: 10)
+        usleep(2_500_000)
+        // ② 三个进程一个不留
+        _ = Shell.sh("killall -9 UniVPN UniVPNCS UniVPNPromoteService 2>/dev/null", timeout: 12)
+        // ③ 等它们真的消失
+        for _ in 0..<14 {
+            if !guiRunning() && !engineAlive() { break }
+            usleep(500_000)
+        }
+        // ④ 趁机清掉残留路由（root 修复器立即响应）
+        try? Data().write(to: URL(fileURLWithPath: "/tmp/uniguard.routefix.trigger"))
+        usleep(3_000_000)
+        // ⑤ 把断线前的配置档写回去，再重新启动
+        restoreProfileBeforeLaunch()
+        launchClient()
+        usleep(8_000_000)
+        let r = clickConnect()
+        log("完全重启后点击结果：\(r)")
+        lastRestart = Date()
+        lastFullRestart = Date()
+        softRestarts = 0
+        fullRestarts += 1
+    }
+
+    private func requestRouteFix() {
+        if Date().timeIntervalSince(lastRouteFixReq) < 5 { return }
+        lastRouteFixReq = Date()
+        act("请求 root 路由修复器（\(snap.staleRoutes.count) 条残留）")
+        try? Data().write(to: URL(fileURLWithPath: "/tmp/uniguard.routefix.trigger"))
+    }
+
+    // MARK: 主循环
+
+    func tick(force: Bool = false) {
+        if paused && !force { return }
+        let now = Date()
+        if now < cooldownUntil && !force {
+            snap.note = "冷却中 \(Int(cooldownUntil.timeIntervalSince(now)))s"
+            onChange?(snap)
+            return
+        }
+
+        // 外部强制触发终极兜底（便于无人值守脚本调用）
+        if FileManager.default.fileExists(atPath: "/tmp/uniguard.fullrestart.trigger") {
+            try? FileManager.default.removeItem(atPath: "/tmp/uniguard.fullrestart.trigger")
+            fullRestart("外部触发")
+            return
+        }
+
+        var s = probe()
+
+        switch s.fault {
+        case .ok:
+            streak = 0
+            if !s.activeProfile.isEmpty {
+                activeProfile = s.activeProfile
+                if pinnedProfile.isEmpty {
+                    targetProfile = s.activeProfile + ".ini"
+                } else {
+                    targetProfile = pinnedProfile
+                }
+            }
+            softRestarts = 0
+            s.note = "隧道正常（\(s.activeProfile.isEmpty ? "档未知" : s.activeProfile)）"
+
+        case .dialogStuck:
+            if Date().timeIntervalSince(lastDialogDismiss) < 30 {
+                s.note = "弹窗刚处理，等待恢复"
+            } else {
+                let n = dismissDialogs()
+                lastDialogDismiss = Date()
+                act("点掉弹窗 \(n) 个")
+                if s.dialogText.contains("超时") || s.dialogText.contains("重新启动客户端") {
+                    softRestart("弹窗：超时/引擎退出")
+                } else {
+                    _ = clickConnect()
+                }
+                cooldownUntil = Date().addingTimeInterval(25)
+                s.note = "已处理弹窗"
+            }
+
+        case .staleRoute:
+            requestRouteFix()
+            cooldownUntil = Date().addingTimeInterval(20)
+            s.note = "已请求清残留路由"
+
+        case .engineDead:
+            launchClient()
+            sleep(4)
+            s = probe()
+            if s.vip.isEmpty { _ = clickConnect() }
+            cooldownUntil = Date().addingTimeInterval(20)
+            s.note = "已拉起客户端"
+
+        case .dialTimeout:
+            streak += 1
+            let r = clickConnect()
+            if r == "connected" {
+                s.note = "客户端已恢复连接"
+                streak = 0
+                cooldownUntil = Date().addingTimeInterval(15)
+            } else {
+                let backoff = min(pow(2.0, Double(streak - 1)) * interval, 240)
+                cooldownUntil = Date().addingTimeInterval(backoff)
+                s.note = "未成功，\(Int(backoff))s 后重试"
+                if streak >= 6 && Date().timeIntervalSince(lastFullRestart) > 300 {
+                    fullRestart("连续 \(streak) 次连不上")
+                    streak = 0
+                    cooldownUntil = Date().addingTimeInterval(60)
+                } else if streak >= 3 && Date().timeIntervalSince(lastRestart) > 90 {
+                    if softRestarts >= 2 {
+                        fullRestart("连续重启无效")
+                        streak = 0
+                        cooldownUntil = Date().addingTimeInterval(60)
+                    } else {
+                        softRestart("连续 \(streak) 次连不上")
+                        streak = 0
+                        cooldownUntil = Date().addingTimeInterval(45)
+                    }
+                }
+            }
+
+        case .tunnelSilent:
+            streak += 1
+            if Date().timeIntervalSince(lastRestart) > 120 {
+                fullRestart("隧道不通")
+                streak = 0
+                cooldownUntil = Date().addingTimeInterval(40)
+                s.note = "已重建隧道"
+            } else {
+                s.note = "隧道异常，观察中"
+            }
+        }
+
+        // 记录状态变迁
+        if lastFault != s.fault {
+            if lastFault == .ok { downCount += 1 }
+            if s.fault == .ok { upCount += 1; okSince = Date() }
+            if s.fault != .ok { okSince = nil }
+            history.append((Date(), s.fault))
+            if history.count > 200 { history.removeFirst(history.count - 200) }
+            log("状态变化：\(lastFault?.rawValue ?? "启动") -> \(s.fault.rawValue)")
+            lastFault = s.fault
+        }
+
+        snap = s
+        onChange?(s)
+    }
+
+    /// 过去 24h 在线时长占比（依据本次进程内的状态变迁估算）
+    func statsText() -> String {
+        let up = upCount, down = downCount
+        return "重连 \(up) 次 · 断开 \(down) 次"
+    }
+
+    func uptimeText() -> String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"
+        if let since = okSince {
+            let d = Int(Date().timeIntervalSince(since))
+            return "已连 \(d/3600)h\((d%3600)/60)m（自 \(f.string(from: since))）"
+        }
+        let d = Int(Date().timeIntervalSince(startedAt))
+        return "守护运行 \(d/3600)h\((d%3600)/60)m"
+    }
+
+    func historyLines(_ n: Int) -> [String] {
+        let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"
+        return history.suffix(n).map { "\(f.string(from: $0.0))  \($0.1.rawValue)" }
+    }
+
+    func startLoop() {
+        log("守护启动 interval=\(Int(interval))s gateway=\(gateway)")
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "uniguard.loop"))
+        t.schedule(deadline: .now() + 3, repeating: interval)
+        t.setEventHandler { self.tick() }
+        t.resume()
+        self.timer = t
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+                self.log("系统唤醒，立即探测")
+                self.cooldownUntil = .distantPast
+                DispatchQueue.global().async { self.tick(force: true) }
+            }
+    }
+    private var timer: DispatchSourceTimer?
+}
