@@ -24,6 +24,7 @@ struct Snapshot {
     var dialogText = ""
     var activeProfile = ""
     var targetProfile = ""
+    var targetSource = "none"
     var pinnedProfile = ""
     var attempt = 0
     var note = ""
@@ -76,6 +77,7 @@ final class Guard {
 
     private init() {
         gateway = resolveGateway()
+        loadPersistedProfile()
     }
 
     /// 网关不写死：优先环境变量，其次当前档配置，最后任一档配置
@@ -83,7 +85,7 @@ final class Guard {
         if let e = ProcessInfo.processInfo.environment["UNIGUARD_GATEWAY"], !e.isEmpty { return e }
         let files = availableProfiles()
         guard !files.isEmpty else { return "" }
-        let last = readLastSession()
+        let last = targetProfile.isEmpty ? readLastSession() : targetProfile
         let pick = files.first(where: { $0 == last }) ?? files[0]
         let path = configDir + "/" + pick
         guard let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return "" }
@@ -128,6 +130,10 @@ final class Guard {
     var pinnedProfile = ""
     private(set) var targetProfile = ""
     private(set) var activeProfile = ""
+    /// 目标档来源：measured=实测到过、pinned=手动锁定、inferred=从客户端记录推断、none=未知
+    private(set) var targetSource = "none"
+
+    private var lastProfileFile: String { NSHomeDirectory() + "/.uniguard/last-profile.txt" }
     private var okSince: Date? = nil
 
     // MARK: 日志
@@ -170,6 +176,19 @@ final class Guard {
     private var sysconfigPath: String { NSHomeDirectory() + "/.UniVPN/sysconfig.ini" }
     private var configDir: String { NSHomeDirectory() + "/.UniVPN/config" }
 
+    private func loadPersistedProfile() {
+        guard let v = (try? String(contentsOfFile: lastProfileFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty else { return }
+        targetProfile = v
+        targetSource = "measured"
+    }
+
+    private func persistProfile(_ v: String) {
+        let dir = NSHomeDirectory() + "/.uniguard"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? v.write(toFile: lastProfileFile, atomically: true, encoding: .utf8)
+    }
+
     func availableProfiles() -> [String] {
         ((try? FileManager.default.contentsOfDirectory(atPath: configDir)) ?? [])
             .filter { $0.hasSuffix(".ini") }.sorted()
@@ -202,14 +221,21 @@ final class Guard {
 
     /// 重启前把目标档写回客户端，确保它连的是断线前那一档
     private func restoreProfileBeforeLaunch() {
-        var want = pinnedProfile.isEmpty ? targetProfile : pinnedProfile
-        if want.isEmpty {
-            // 还没跑过一次成功探测：直接以客户端记录的「上次会话」为准
-            want = readLastSession()
-            targetProfile = want
-            log("配置档：从客户端记录推断目标 = \(want.isEmpty ? "未知" : want)")
+        var want = targetProfile
+        if !pinnedProfile.isEmpty {
+            want = pinnedProfile
+            targetSource = "pinned"
         }
-        guard !want.isEmpty else { log("配置档：无可用目标，按客户端自己记忆连"); return }
+        if want.isEmpty {
+            // 从没实测过（例如刚装、还没授权）：只能退而用客户端记录，并明确标注是推断
+            let guess = readLastSession()
+            guard !guess.isEmpty else { log("配置档：未知目标，按客户端自己记忆连"); return }
+            want = guess
+            targetSource = "inferred"
+            log("配置档：尚未实测过档位，按客户端记录推断 = \(guess)（未写回，避免污染）")
+            return
+        }
+        if targetSource == "pinned" { log("配置档：按锁定档 \(want) 处理") }
         let cur = readLastSession()
         if cur != want {
             let ok = setLastSession(want)
@@ -316,6 +342,7 @@ final class Guard {
             s.activeProfile = toks[idx + 1]
         }
         s.targetProfile = targetProfile
+        s.targetSource = pinnedProfile.isEmpty ? targetSource : "pinned"
         let badDialog = ["超时", "重新启动客户端", "已退出"].first { ui.texts.contains($0) } != nil
 
         if !s.engineAlive {
@@ -454,21 +481,36 @@ final class Guard {
             return
         }
 
+        // 网关跟随「断线前档位」动态更新，避免用错档的网关做判断
+        let wantGW = resolveGateway()
+        if !wantGW.isEmpty && wantGW != gateway {
+            log("网关更新：\(gateway.isEmpty ? "未知" : gateway) -> \(wantGW)（跟随 \(targetProfile)）")
+            gateway = wantGW
+        }
+
         var s = probe()
 
         switch s.fault {
         case .ok:
             streak = 0
             if !s.activeProfile.isEmpty {
-                activeProfile = s.activeProfile
-                if pinnedProfile.isEmpty {
-                    targetProfile = s.activeProfile + ".ini"
-                } else {
-                    targetProfile = pinnedProfile
+                let seen = s.activeProfile + ".ini"
+                if activeProfile != s.activeProfile || targetProfile != seen {
+                    activeProfile = s.activeProfile
+                    if pinnedProfile.isEmpty {
+                        targetProfile = seen
+                        targetSource = "measured"
+                        persistProfile(seen)
+                        let gw = resolveGateway()
+                        if !gw.isEmpty { gateway = gw }
+                        log("配置档：实测当前档 = \(s.activeProfile)，已记为断线前档位")
+                    }
                 }
             }
             softRestarts = 0
-            s.note = "隧道正常（\(s.activeProfile.isEmpty ? "档未知" : s.activeProfile)）"
+            let pname = !s.activeProfile.isEmpty ? s.activeProfile
+                      : (targetProfile.isEmpty ? "档未知" : targetProfile.replacingOccurrences(of: ".ini", with: ""))
+            s.note = "隧道正常（\(pname)）"
 
         case .dialogStuck:
             if Date().timeIntervalSince(lastDialogDismiss) < 30 {

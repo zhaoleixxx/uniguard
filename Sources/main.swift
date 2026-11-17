@@ -113,7 +113,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let g2 = Guard.shared
         let pin = g2.pinnedProfile
-        profileLine.title = "断线前档位：\(s.activeProfile.isEmpty ? g2.targetProfile : s.activeProfile)" + (pin.isEmpty ? "" : "　（锁定 \(pin)）")
+        let shown = !pin.isEmpty ? pin
+                  : (!s.activeProfile.isEmpty ? s.activeProfile + ".ini" : g2.targetProfile)
+        let srcLabel: String
+        if !pin.isEmpty { srcLabel = "锁定" }
+        else if g2.targetSource == "measured" { srcLabel = "实测" }
+        else if g2.targetSource == "inferred" { srcLabel = "推断，未记录" }
+        else { srcLabel = "未知" }
+        let label = shown.isEmpty ? "未知（授权后自动识别）" : shown.replacingOccurrences(of: ".ini", with: "")
+        profileLine.title = "断线前档位：\(label)　（\(srcLabel)）"
 
         if let sub = profileItem.submenu {
             sub.removeAllItems()
