@@ -26,15 +26,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var uptimeLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     var statsLine  = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     var actionLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    var dnsLine = NSMenuItem(title: "DNS 守护：启动中", action: nil, keyEquivalent: "")
     var historyItem = NSMenuItem(title: "最近状态变化", action: nil, keyEquivalent: "")
     var profileItem = NSMenuItem(title: "目标配置档", action: nil, keyEquivalent: "")
     var profileLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     var pauseItem: NSMenuItem!
+    var dnsToggleItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
-        for m in [statusLine, detailLine, uptimeLine, statsLine, actionLine, profileLine] { m.isEnabled = false; menu.addItem(m) }
+        for m in [statusLine, detailLine, uptimeLine, statsLine, actionLine, dnsLine, profileLine] { m.isEnabled = false; menu.addItem(m) }
         menu.addItem(.separator())
 
         let reconnect = NSMenuItem(title: "立即重连", action: #selector(reconnectNow), keyEquivalent: "r")
@@ -45,6 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let fix = NSMenuItem(title: "清理残留路由", action: #selector(fixRoute), keyEquivalent: "f")
         fix.target = self; menu.addItem(fix)
+
+        let fixDNS = NSMenuItem(title: "立即清理 VPN DNS", action: #selector(fixDNSNow), keyEquivalent: "d")
+        fixDNS.target = self; menu.addItem(fixDNS)
+
+        dnsToggleItem = NSMenuItem(title: "暂停 DNS 守护", action: #selector(toggleDNSGuard), keyEquivalent: "D")
+        dnsToggleItem.target = self; menu.addItem(dnsToggleItem)
 
         let hard = NSMenuItem(title: "彻底重启客户端", action: #selector(hardRestart), keyEquivalent: "R")
         hard.target = self; menu.addItem(hard)
@@ -113,6 +121,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statsLine.title = g.statsText() + (s.staleRoutes.isEmpty ? "" : "　残留 \(s.staleRoutes.count)")
         actionLine.title = s.note.isEmpty ? "上次动作：\(s.lastAction)" : "\(s.note)　[\(s.lastAction)]"
 
+        if !s.dnsGuardOn {
+            dnsLine.title = "DNS 守护：已暂停"
+        } else if s.badDNS.isEmpty {
+            dnsLine.title = "DNS 守护：正常"
+        } else {
+            dnsLine.title = "DNS 守护：待清理 \(s.badDNS.joined(separator: "、"))"
+        }
+        dnsToggleItem.title = s.dnsGuardOn ? "暂停 DNS 守护" : "恢复 DNS 守护"
+
         let g2 = Guard.shared
         let pin = g2.pinnedProfile
         let shown = !pin.isEmpty ? pin
@@ -179,6 +196,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func fixRoute() {
         try? Data().write(to: URL(fileURLWithPath: "/tmp/uniguard.routefix.trigger"))
         Guard.shared.log("手动请求路由修复")
+    }
+
+    @objc func fixDNSNow() {
+        DispatchQueue.global().async {
+            let hits = Guard.shared.dnsScan(force: true)
+            if hits.isEmpty {
+                Guard.shared.log("DNS：当前没有命中黑名单的 DNS")
+            } else {
+                Guard.shared.requestDNSFix("手动")
+            }
+            DispatchQueue.main.async { self.render(Guard.shared.probe()) }
+        }
+    }
+
+    @objc func toggleDNSGuard() {
+        let on = !Guard.shared.dnsGuardEnabled
+        Guard.shared.setDNSGuard(on)
+        render(Guard.shared.probe())
     }
 
     @objc func togglePause() {

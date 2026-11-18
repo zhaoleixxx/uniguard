@@ -29,6 +29,10 @@ struct Snapshot {
     var attempt = 0
     var note = ""
     var lastAction = ""
+    /// 命中黑名单的 DNS（形如 "Wi-Fi:61.139.2.69"）
+    var badDNS: [String] = []
+    /// DNS 守护是否启用（用户在菜单里可暂停）
+    var dnsGuardOn = true
 }
 
 // MARK: - Shell
@@ -114,6 +118,14 @@ final class Guard {
     private var lastDialogDismiss = Date.distantPast
     private var lastRouteFixReq = Date.distantPast
     private var lastActionText = ""
+
+    // DNS 守护：客户端每次连上会把电信 DNS 插到列表最前面，导致解析先走它
+    private var lastDNSFixReq = Date.distantPast
+    private var lastDNSBad: [String] = []
+    private var dnsScanAt = Date.distantPast
+    private var dnsScanCache: [String] = []
+    private var dnsGuardOffFile: String { NSHomeDirectory() + "/.uniguard/dns-guard.off" }
+    private var badDNSConfigFile: String { "/usr/local/etc/uniguard/bad-dns.txt" }
 
     // 运行记录
     var startedAt = Date()
@@ -370,6 +382,8 @@ final class Guard {
         }
         s.attempt = streak
         s.lastAction = lastActionText
+        s.dnsGuardOn = dnsGuardEnabled
+        s.badDNS = s.dnsGuardOn ? dnsScan() : []
         return s
     }
 
@@ -548,6 +562,77 @@ final class Guard {
         try? Data().write(to: URL(fileURLWithPath: "/tmp/uniguard.routefix.trigger"))
     }
 
+    // MARK: DNS 守护
+
+    /// 黑名单：默认 61.139.2.69，可在 /usr/local/etc/uniguard/bad-dns.txt 增删（每行一个）
+    func badDNSList() -> [String] {
+        var list = ["61.139.2.69"]
+        if let s = try? String(contentsOfFile: badDNSConfigFile, encoding: .utf8) {
+            for line in s.split(separator: "\n") {
+                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty && !t.hasPrefix("#") { list.append(t) }
+            }
+        }
+        return Array(Set(list)).sorted()
+    }
+
+    var dnsGuardEnabled: Bool {
+        !FileManager.default.fileExists(atPath: dnsGuardOffFile)
+    }
+
+    /// 扫描所有网络服务，返回形如 ["Wi-Fi:61.139.2.69"] 的命中项（5 秒缓存，避免每次都起一堆进程）
+    func dnsScan(force: Bool = false) -> [String] {
+        if !force && Date().timeIntervalSince(dnsScanAt) < 5 { return dnsScanCache }
+        dnsScanAt = Date()
+        let bad = Set(badDNSList())
+        var hits: [String] = []
+        let (_, out) = Shell.run("/usr/sbin/networksetup", ["-listallnetworkservices"], timeout: 8)
+        for raw in out.split(separator: "\n").dropFirst() {
+            let svc = raw.trimmingCharacters(in: .whitespaces)
+            if svc.isEmpty || svc.hasPrefix("*") { continue }
+            let (_, d) = Shell.run("/usr/sbin/networksetup", ["-getdnsservers", svc], timeout: 8)
+            for line in d.split(separator: "\n") {
+                let ip = line.trimmingCharacters(in: .whitespaces)
+                if bad.contains(ip) { hits.append("\(svc):\(ip)") }
+            }
+        }
+        dnsScanCache = hits
+        return hits
+    }
+
+    /// 请求 root DNS 守护立即清理（平时它自己每 8 秒扫一次）
+    func requestDNSFix(_ why: String) {
+        lastDNSFixReq = Date()
+        try? Data().write(to: URL(fileURLWithPath: "/tmp/uniguard.dnsfix.trigger"))
+        log("DNS：请求清理（\(why)）")
+    }
+
+    func setDNSGuard(_ on: Bool) {
+        let dir = NSHomeDirectory() + "/.uniguard"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if on {
+            try? FileManager.default.removeItem(atPath: dnsGuardOffFile)
+            log("DNS：守护已恢复")
+            requestDNSFix("手动恢复后立即清理")
+        } else {
+            try? "off".write(toFile: dnsGuardOffFile, atomically: true, encoding: .utf8)
+            log("DNS：守护已暂停（客户端塞的 DNS 会保留）")
+        }
+    }
+
+    /// 每轮探测后调用：发现黑名单就通知 root 清，清干净了记一笔
+    private func handleDNS(_ s: Snapshot) {
+        guard s.dnsGuardOn else { lastDNSBad = s.badDNS; return }
+        if !s.badDNS.isEmpty {
+            if s.badDNS != lastDNSBad && Date().timeIntervalSince(lastDNSFixReq) > 15 {
+                requestDNSFix(s.badDNS.joined(separator: "、"))
+            }
+        } else if !lastDNSBad.isEmpty {
+            log("DNS：已清理，DNS 恢复正常")
+        }
+        lastDNSBad = s.badDNS
+    }
+
     // MARK: 主循环
 
     func tick(force: Bool = false) {
@@ -576,6 +661,9 @@ final class Guard {
         }
 
         var s = probe()
+
+        // DNS 守护：客户端连上时会把 61.139.2.69 插到 DNS 首位，发现就清
+        handleDNS(s)
 
         // 刚检测到掉线：先做一次"零代价"的残留路由预清理
         // （有就删掉，没有最多报个 not in table，不影响后续阶梯）

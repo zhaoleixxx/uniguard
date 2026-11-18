@@ -7,6 +7,17 @@ chmod 755 /usr/local/libexec/uniguard-routefix.sh
 touch /var/log/uniguard-routefix.log
 chmod 644 /var/log/uniguard-routefix.log
 
+# DNS 黑名单配置（存在就保留用户修改）
+mkdir -p /usr/local/etc/uniguard
+if [ ! -f /usr/local/etc/uniguard/bad-dns.txt ]; then
+    cat > /usr/local/etc/uniguard/bad-dns.txt <<'CONF'
+# UniGuard DNS 守护：这些地址一旦出现在任一网络服务的 DNS 列表里就被删掉
+# 每行一个 IPv4，可用 # 注释
+61.139.2.69
+CONF
+fi
+chmod 644 /usr/local/etc/uniguard/bad-dns.txt
+
 cat > /Library/LaunchDaemons/com.uniguard.routefix.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

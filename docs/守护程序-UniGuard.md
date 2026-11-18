@@ -128,3 +128,53 @@ osascript -e 'do shell script "'"$PWD"'/tools/install-routefix.sh" with administ
 - root 侧日志：`删除网关坏路由 125.71.210.99（下一跳 172.16.99.2 属于隧道池且已不存在）`
 - 守护侧日志：`请求清理残留路由（目标网关 125.71.210.99）：兜底重启前清理` → `残留路由已清空` → 写回档位 → 启动客户端 → 隧道恢复
 
+
+## DNS 守护：清掉客户端硬塞的 DNS（v1.6）
+
+### 现象
+UniVPN 每次连上，会把 `61.139.2.69` 加到当前网络服务（如 Wi-Fi）的 DNS 列表**第一位**。
+系统优先用它解析，该服务器在隧道外的网络里经常不响应，于是表现为：
+隧道、网关都通，但浏览器/终端域名全部超时 —— 「VPN 连上了反而上不了网」。
+
+`networksetup -getdnsservers "Wi-Fi"` 可以看到它在最前面：
+```
+61.139.2.69
+8.8.8.8
+223.5.5.5
+114.114.114.114
+```
+
+### 为什么放在 root 修复器里
+`networksetup -setdnsservers` 明确要求管理员权限（非 root 直接 `Error: Command requires admin privileges`，返回码 14）。
+UniGuard 已有 root 常驻的 `com.uniguard.routefix`，把 DNS 巡检挂进去即可，**不用再要一次密码、也不用额外常驻进程**。
+
+### 规则
+| 项 | 值 |
+|---|---|
+| 巡检周期 | 每 2 轮（约 8 秒），另加启动时、收到触发文件时立即执行 |
+| 黑名单 | 默认 `61.139.2.69`；可在 `/usr/local/etc/uniguard/bad-dns.txt` 每行一个追加 |
+| 处理方式 | 从该服务的 DNS 列表里**只删黑名单条目**，顺序与其余条目保持不变；删空则 `-setdnsservers <服务> Empty`（走 DHCP） |
+| 暂停 | 菜单「暂停 DNS 守护」或 `touch ~/.uniguard/dns-guard.off` |
+| 手动触发 | 菜单「立即清理 VPN DNS」（⌘D）→ 写 `/tmp/uniguard.dnsfix.trigger` |
+
+### 两侧日志
+root（`/var/log/uniguard-routefix.log`）：
+```
+[2026-11-18 12:05:33] routefix 启动（DNS 黑名单：61.139.2.69 ）
+[2026-11-18 12:05:33] DNS：Wi-Fi 删除 61.139.2.69，保留 8.8.8.8 223.5.5.5 114.114.114.114
+```
+用户级（`~/Library/Logs/UniGuard.log`）：
+```
+[12:05:26] DNS：请求清理（Wi-Fi:61.139.2.69）
+[12:05:41] DNS：已清理，DNS 恢复正常
+```
+菜单同时显示 `DNS 守护：正常 / 待清理 Wi-Fi:61.139.2.69 / 已暂停`。
+
+### 实测
+1. 手工把 `61.139.2.69` 设回 Wi-Fi DNS 首位；
+2. 8 秒内 root 日志出现「DNS：Wi-Fi 删除 61.139.2.69，保留 …」；
+3. `networksetup -getdnsservers "Wi-Fi"` 不再含该地址，`nslookup www.baidu.com` 正常返回。
+
+### 注意
+如果某个内网域名**只**能由该 DNS 解析，删掉后会解析失败。此时把该地址从黑名单里去掉（或暂停 DNS 守护），
+改为在「系统设置 → 网络 → 高级 → DNS」里把它排到最后一位即可。
