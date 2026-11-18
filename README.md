@@ -106,6 +106,31 @@ sudo launchctl bootout system/com.uniguard.routefix
 sudo rm -f /Library/LaunchDaemons/com.uniguard.routefix.plist /usr/local/libexec/uniguard-routefix.sh
 ```
 
+## 残留路由清理（按档位定向）
+
+断开异常时，客户端会在路由表里留下一条指向网关的主机路由（`route add -host <网关> <隧道内地址>`）。
+隧道销毁后这条路由还在，后续所有发往网关的包都会被它带进黑洞，表现就是"怎么点连接都连不上、只报返回码超时"。
+
+UniGuard 的处理方式：
+
+- **定向**：清理请求里带当前配置档的网关 IP，root 修复器优先清这一条，不去动其它档的路由。
+- **绑进失败阶梯**，不是靠旁路碰运气：
+  - 二级重启（重启 GUI）启动客户端前先清一次，并等到真的清干净再启动；
+  - 三级兜底（完全退出重启）第 ④ 步同样先清后启；
+  - 连续拨号失败 ≥ 2 次时立即触发一次（90 秒内不重复）。
+- **两种残留形态都能识别**（必须直接扫路由表，`route get` 会被 `/32` 克隆路由掩盖）：
+  1. 接口指向已经不存在的 `utunN`；
+  2. 接口看着正常（en0），但下一跳落在隧道地址池里、而该地址已不被任何存活 utun 拥有。
+
+只读自查（不修改任何东西）：
+
+```sh
+# 当前网关的主机路由
+netstat -rn -f inet | grep $(grep -h GatewayAddress ~/.UniVPN/config/*.ini | cut -d= -f2 | tr -d " ")
+# 存活隧道与 VIP
+ifconfig | grep -A3 '^utun'
+```
+
 ## 限制
 
 - 依赖客户端自身的登录态（记住密码/自动登录需已开启），守护不保存任何凭据。

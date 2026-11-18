@@ -484,18 +484,37 @@ final class Guard {
         fullRestarts += 1
     }
 
-    /// 只读扫描：是否存在指向已消失 utun 的路由
+    /// 只读扫描：坏路由（指向已消失 utun，或经由隧道池里已不存在的地址）
     func deadUtunRoutes() -> [String] {
         let live = Set(
             Shell.sh("/sbin/ifconfig | awk '/^utun[0-9]+: flags/{print $1}' | tr -d ':'", timeout: 8).1
                 .split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }
         )
+        let vips = Shell.sh("/sbin/ifconfig | awk '/^utun[0-9]+:/{t=1} /inet /{if(t==1) print $2} /^[a-z]/&&!/^utun/{t=0}'", timeout: 8).1
+            .split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }
+        let vipSet = Set(vips)
+        let prefixes = Set(vips.compactMap { v -> String? in
+            let p = v.split(separator: ".")
+            return p.count >= 2 ? "\(p[0]).\(p[1])." : nil
+        })
+
         var out: [String] = []
         let rows = Shell.sh("/usr/sbin/netstat -rn -f inet", timeout: 10).1.split(separator: "\n")
         for row in rows.dropFirst() {
             let cols = row.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-            guard let dst = cols.first, let ifc = cols.last, ifc.hasPrefix("utun") else { continue }
-            if !live.contains(ifc) { out.append("\(dst) -> \(ifc)") }
+            guard cols.count >= 2, let dst = cols.first else { continue }
+            let via = cols[1]
+            let ifc = cols.last ?? ""
+            if ifc.hasPrefix("utun"), !live.contains(ifc) {
+                out.append("\(dst) -> \(ifc)")
+                continue
+            }
+            // 网关路由经由隧道池地址，但该地址没有任何存活 utun 拥有
+            if !gateway.isEmpty, dst == gateway || dst == gateway + "/32", !ifc.hasPrefix("utun") {
+                if prefixes.contains(where: { via.hasPrefix($0) }), !vipSet.contains(via) {
+                    out.append("\(dst) 经由 \(via)（隧道已不存在）")
+                }
+            }
         }
         return out
     }
@@ -507,7 +526,7 @@ final class Guard {
         let target = gateway.isEmpty ? "" : gateway
         // 触发文件内容 = 目标网关，root 端按它优先清理
         try? target.write(toFile: "/tmp/uniguard.routefix.trigger", atomically: true, encoding: .utf8)
-        log("请求清理残留存路由（目标网关 \(target.isEmpty ? "未知" : target)）：\(reason)")
+        log("请求清理残留路由（目标网关 \(target.isEmpty ? "未知" : target)）：\(reason)")
 
         let deadline = Date().addingTimeInterval(wait)
         while Date() < deadline {
