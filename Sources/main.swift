@@ -85,22 +85,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.button?.image = img
         }
 
-        // 菜单栏文字：一眼看状态
         let g = Guard.shared
-        let short: String
-        switch s.fault {
-        case .ok:
-            if let t = g.history.last, t.1 == .ok {
-                let sec = Int(Date().timeIntervalSince(t.0))
-                short = String(format: "在线 %dh%02dm", sec / 3600, (sec % 3600) / 60)
-            } else { short = "在线" }
-        case .engineDead:   short = "引擎停"
-        case .dialTimeout:  short = "重连中"
-        case .staleRoute:   short = "残留路由"
-        case .dialogStuck:  short = "弹窗阻塞"
-        case .tunnelSilent: short = "隧道异常"
-        }
-        item.button?.title = " " + short
+        // 菜单栏只留图标：状态靠图形表达，不进文字（时长等细节都在菜单里）
+        item.button?.title = ""
+        item.button?.appearsDisabled = Guard.shared.paused
         item.button?.toolTip = "\(s.fault.rawValue)｜\(s.vip.isEmpty ? "无隧道" : s.vip)"
 
         statusLine.title = "状态：\(s.fault.rawValue)\(g.paused ? "（守护暂停）" : "")"
