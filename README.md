@@ -24,7 +24,9 @@ macOS 菜单栏守护程序：持续监控某个企业 VPN 客户端（华为 SV
 UniGuard.app            菜单栏守护程序（用户级 LaunchAgent 常驻）
 └─ 探测：utun 接口 / VIP / 引擎进程 / 网关 TCP 1024 / 残留路由 / 客户端弹窗 / DNS 黑名单
 └─ 恢复：点连接 → 重启客户端 → 彻底退出并重启
+└─ 退出：连同 UniVPN 一起退掉 → 清掉客户端塞的 DNS → 保持退出
 tools/uniguard-routefix.sh   root 级修复器（LaunchDaemon 常驻，每 8 秒扫路由与 DNS）
+tools/uniguard-watch.sh      反向守护（LaunchAgent 每 5 秒）：UniVPN 启动 → 把 UniGuard 拉起来
 ```
 
 ## 安装
@@ -86,6 +88,27 @@ UniGuard 的做法：
 ```
 [12:05:33] DNS：Wi-Fi 删除 61.139.2.69，保留 8.8.8.8 223.5.5.5 114.114.114.114
 ```
+
+## 退出与启动联动（v1.7 / v1.8）
+
+**退出**（菜单「退出守护」或 `touch /tmp/uniguard.quit.trigger`）做三件事：
+
+1. 退出 UniVPN 客户端，含 `UniVPN` / `UniVPNCS` / `UniVPNPromoteService` 三个进程；
+2. 立刻让 root 端清一次 DNS（客户端退出后常把 `61.139.2.69` 留在列表里），并等到真的干净；
+3. 以退出码 0 结束，写入 `~/.uniguard/quit.flag`。
+
+因为 LaunchAgent 用的是 `KeepAlive.SuccessfulExit=false`：**正常退出不会被拉回来，崩溃/被强杀仍会自动重启**。
+
+**再启动**：反向守护 `com.uniguard.watch`（每 5 秒）发现 `UniVPN` 从「没运行」变成「运行」，就清掉 `quit.flag` 并把 UniGuard 拉起来（`launchctl kickstart`）。所以：
+
+| 操作 | 结果 |
+|---|---|
+| 点「退出守护」 | 守护和 VPN 一起退出，保持退出 |
+| 之后手动启动 UniVPN | 守护跟着自动起来，`quit.flag` 自动清除 |
+| 守护崩溃 / 被 `kill -9` | launchd 立刻重启（正常保护） |
+| 手动打开 UniGuard.app | 守护启动并清除 `quit.flag` |
+
+另外 v1.8 还加了启动观察期：守护刚启动的 30 秒内不抢着点连接，隧道「持续」不通 60 秒才重建，避免和客户端自己的登录流程打架。
 
 ## 恢复阶梯
 

@@ -122,9 +122,11 @@ final class Guard {
     // DNS 守护：客户端每次连上会把电信 DNS 插到列表最前面，导致解析先走它
     private var lastDNSFixReq = Date.distantPast
     private var lastDNSBad: [String] = []
+    private var silentSince: Date? = nil
     private var dnsScanAt = Date.distantPast
     private var dnsScanCache: [String] = []
-    private var dnsGuardOffFile: String { NSHomeDirectory() + "/.uniguard/dns-guard.off" }
+    var dnsGuardOffFile: String { NSHomeDirectory() + "/.uniguard/dns-guard.off" }
+    var quitFlagFile: String { NSHomeDirectory() + "/.uniguard/quit.flag" }
     private var badDNSConfigFile: String { "/usr/local/etc/uniguard/bad-dns.txt" }
 
     // 运行记录
@@ -498,6 +500,55 @@ final class Guard {
         fullRestarts += 1
     }
 
+    /// 记下「是用户主动退出的」，watch 守护看到这个标记就不再把它拉起来，
+    /// 直到下一次 UniVPN 重新启动（watch 会清掉标记）。
+    func markQuitByUser() {
+        let dir = NSHomeDirectory() + "/.uniguard"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? "quit".write(toFile: quitFlagFile, atomically: true, encoding: .utf8)
+    }
+
+    func clearQuitFlag() {
+        try? FileManager.default.removeItem(atPath: quitFlagFile)
+    }
+
+    /// 退出守护前把 VPN 客户端一起收掉：否则守护退了，客户端还在后台重连、改 DNS
+    func shutdownVPN() {        act("退出客户端（随守护一起退出）")
+        _ = Shell.osa("tell application \"UniVPN\" to quit", timeout: 8)
+        usleep(1_500_000)
+        _ = Shell.sh("killall -9 UniVPN UniVPNCS UniVPNPromoteService 2>/dev/null", timeout: 12)
+        usleep(500_000)
+        let left = Shell.sh("pgrep -x UniVPN; pgrep -x UniVPNCS; pgrep -x UniVPNPromoteService", timeout: 6).1
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if left.isEmpty {
+            log("客户端已全部退出")
+        } else {
+            log("仍有客户端进程：\(left.replacingOccurrences(of: "\n", with: ","))")
+        }
+        flushDNS(reason: "退出客户端后")
+    }
+
+    /// 让 root 端立刻清一次 DNS，并等到真的干净（客户端退出后可能把 61.139.2.69 留在列表里）
+    private func flushDNS(reason: String) {
+        guard dnsGuardEnabled else { return }
+        let hits = dnsScan(force: true)
+        try? Data().write(to: URL(fileURLWithPath: "/tmp/uniguard.dnsfix.trigger"))
+        if hits.isEmpty {
+            log("DNS：当前干净（\(reason)）")
+            return
+        }
+        log("DNS：\(hits.joined(separator: "、"))，退出前清理（\(reason)）")
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            usleep(700_000)
+            if dnsScan(force: true).isEmpty {
+                log("DNS：已删除 \(hits.joined(separator: "、"))，DNS 恢复正常")
+                return
+            }
+        }
+        log("DNS：仍有残留 \(dnsScan(force: true).joined(separator: "、"))，root 守护会继续清理")
+    }
+
     /// 只读扫描：坏路由（指向已消失 utun，或经由隧道池里已不存在的地址）
     func deadUtunRoutes() -> [String] {
         let live = Set(
@@ -638,6 +689,16 @@ final class Guard {
     func tick(force: Bool = false) {
         if paused && !force { return }
         let now = Date()
+
+        // 外部请求退出（脚本/远程；退出时连同 VPN 客户端一起收掉）
+        if FileManager.default.fileExists(atPath: "/tmp/uniguard.quit.trigger") {
+            try? FileManager.default.removeItem(atPath: "/tmp/uniguard.quit.trigger")
+            log("退出守护（外部触发）")
+            paused = true
+            markQuitByUser()
+            shutdownVPN()
+            exit(0)
+        }
         if now < cooldownUntil && !force {
             snap.note = "冷却中 \(Int(cooldownUntil.timeIntervalSince(now)))s"
             onChange?(snap)
@@ -725,6 +786,12 @@ final class Guard {
             s.note = "已拉起客户端"
 
         case .dialTimeout:
+            // 刚启动时客户端可能正在自动登录，先观察一轮，别抢着点/重启
+            if Date().timeIntervalSince(startedAt) < 30 {
+                s.note = "启动观察期，等客户端自己登录"
+                cooldownUntil = Date().addingTimeInterval(10)
+                break
+            }
             streak += 1
             if streak >= 2 && Date().timeIntervalSince(lastRouteFixReq) > 90 {
                 _ = requestRouteFixAndWait("连不上第 \(streak) 次", wait: 8)
@@ -768,16 +835,22 @@ final class Guard {
             }
 
         case .tunnelSilent:
+            if silentSince == nil { silentSince = Date() }
             streak += 1
-            if Date().timeIntervalSince(lastRestart) > 120 {
-                fullRestart("隧道不通")
+            // 隧道要「持续」不通才重建，避免刚连上还在握手的瞬间被误判
+            if Date().timeIntervalSince(lastRestart) > 120,
+               Date().timeIntervalSince(silentSince ?? Date()) > 60 {
+                fullRestart("隧道持续不通")
                 streak = 0
+                silentSince = nil
                 cooldownUntil = Date().addingTimeInterval(40)
                 s.note = "已重建隧道"
             } else {
                 s.note = "隧道异常，观察中"
             }
         }
+
+        if s.fault != .tunnelSilent { silentSince = nil }
 
         // 记录状态变迁
         if lastFault != s.fault {

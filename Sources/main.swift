@@ -71,6 +71,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.imagePosition = .imageLeft
 
         let g = Guard.shared
+        // 只要守护真的跑起来了，就清掉「用户主动退出」标记
+        g.clearQuitFlag()
         // 网关由 Guard 按「断线前档位」解析，这里只在完全没解析到时兜底
         if g.gateway.isEmpty { g.gateway = readGatewayFromConfig() }
         g.onChange = { [weak self] s in DispatchQueue.main.async { self?.render(s) } }
@@ -224,7 +226,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showLog() { NSWorkspace.shared.open(URL(fileURLWithPath: Guard.shared.logPath)) }
 
-    @objc func quit() { NSApp.terminate(nil) }
+    @objc func quit() {
+        Guard.shared.log("退出守护（手动退出，客户端一并退出，直到下次启动 UniVPN）")
+        Guard.shared.paused = true
+        Guard.shared.markQuitByUser()
+        // 先把 VPN 客户端也退掉、把客户端塞的 DNS 清掉，再以退出码 0 结束；
+        // KeepAlive.SuccessfulExit=false 保证 launchd 不会把它重新拉起来（崩溃/被强杀仍会重启）
+        DispatchQueue.global().async {
+            Guard.shared.shutdownVPN()
+            exit(0)
+        }
+    }
 }
 
 let app = NSApplication.shared

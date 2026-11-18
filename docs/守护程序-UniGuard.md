@@ -178,3 +178,44 @@ root（`/var/log/uniguard-routefix.log`）：
 ### 注意
 如果某个内网域名**只**能由该 DNS 解析，删掉后会解析失败。此时把该地址从黑名单里去掉（或暂停 DNS 守护），
 改为在「系统设置 → 网络 → 高级 → DNS」里把它排到最后一位即可。
+
+## 退出与启动联动（v1.7 / v1.8）
+
+### 退出（菜单「退出守护」，或 `touch /tmp/uniguard.quit.trigger`）
+1. 退出 UniVPN：先 AppleScript `quit`，2 秒后 `killall -9 UniVPN UniVPNCS UniVPNPromoteService`，再确认进程消失；
+2. 让 root 端立即清一次 DNS 并等到真的干净（客户端退出后常把 `61.139.2.69` 留在列表里）；
+3. 写 `~/.uniguard/quit.flag`，以退出码 0 结束。
+
+LaunchAgent 用 `KeepAlive.SuccessfulExit=false`：**正常退出不重启，崩溃/被强杀仍由 launchd 拉起**。
+
+### 再启动：反向守护 com.uniguard.watch
+`~/Library/LaunchAgents/com.uniguard.watch.plist` 每 5 秒跑一次 `uniguard-watch.sh`：
+
+```
+读 ~/.uniguard/vpn.state（上一轮的 0/1）→ 与当前 pgrep -x UniVPN 对比
+  0 → 1（VPN 刚启动）：删掉 quit.flag
+  VPN 在跑 + 有 quit.flag      → 什么都不做（尊重用户退出）
+  VPN 在跑 + 无 quit.flag + 守护没在跑 → launchctl kickstart com.uniguard.agent
+```
+
+因此：
+| 操作 | 结果 |
+|---|---|
+| 点「退出守护」 | 守护和 VPN 一起退出，保持退出（不会被自己拉回来） |
+| 之后手动启动 UniVPN | 5 秒内守护自动起来 |
+| 守护崩溃 / `kill -9` | launchd 立即重启 |
+| 手动打开 UniGuard.app | 启动并清除 `quit.flag` |
+
+### 启动观察期（v1.8.1）
+守护刚启动的 30 秒内不点「连接」、不重启客户端（`启动观察期，等客户端自己登录`）；
+「隧道起来了但不通」也不再立刻兜底，而是**持续 60 秒**不通才重建。避免守护刚被拉起就和客户端自己的自动登录抢操作。
+
+### 实测
+```
+[12:52:30] 退出守护（外部触发） → 动作：退出客户端（随守护一起退出）
+[12:52:33] 客户端已全部退出
+[12:52:34] DNS：当前干净（退出客户端后）
+（20 秒后守护仍为 -，未被拉起）
+[12:54:34] watch：检测到 UniVPN 启动，已拉起守护
+[12:54:35] 守护启动 interval=15s gateway=125.71.210.99
+```

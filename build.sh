@@ -4,6 +4,8 @@ cd "$(dirname "$0")"
 APP="build/UniGuard.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp tools/uniguard-watch.sh "$APP/Contents/Resources/uniguard-watch.sh"
+chmod 755 "$APP/Contents/Resources/uniguard-watch.sh"
 
 swiftc -swift-version 5 -target arm64-apple-macos13.0 -O \
   -sdk "$(xcrun --show-sdk-path)" \
@@ -19,7 +21,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>com.uniguard.app</string>
   <key>CFBundleName</key><string>UniGuard</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.6</string>
+  <key>CFBundleShortVersionString</key><string>1.8.1</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
