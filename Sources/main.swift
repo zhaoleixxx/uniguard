@@ -80,8 +80,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .dialogStuck:  name = "bell.badge"
         case .tunnelSilent: name = "exclamationmark.triangle"
         }
-        if let img = NSImage(systemSymbolName: name, accessibilityDescription: s.fault.rawValue) {
-            img.isTemplate = true
+        // 彩色图标：不同状态不同颜色（暂停时灰掉）
+        let color: NSColor
+        switch s.fault {
+        case .ok:           color = .systemGreen
+        case .dialTimeout:  color = .systemOrange
+        case .engineDead:   color = .systemRed
+        case .staleRoute:   color = .systemYellow
+        case .dialogStuck:  color = .systemPurple
+        case .tunnelSilent: color = .systemRed
+        }
+        let useColor: NSColor = Guard.shared.paused ? .secondaryLabelColor : color
+        let cfg = NSImage.SymbolConfiguration(paletteColors: [useColor])
+        if let base = NSImage(systemSymbolName: name, accessibilityDescription: s.fault.rawValue),
+           let img = base.withSymbolConfiguration(cfg) {
+            img.isTemplate = false
             item.button?.image = img
         }
 
