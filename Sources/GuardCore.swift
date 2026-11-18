@@ -577,6 +577,14 @@ final class Guard {
 
         var s = probe()
 
+        // 刚检测到掉线：先做一次"零代价"的残留路由预清理
+        // （有就删掉，没有最多报个 not in table，不影响后续阶梯）
+        if s.fault != .ok, lastFault == nil || lastFault == .ok {
+            if Date().timeIntervalSince(lastRouteFixReq) > 60 {
+                _ = requestRouteFixAndWait("掉线预清理", wait: 4)
+            }
+        }
+
         switch s.fault {
         case .ok:
             streak = 0
@@ -616,9 +624,9 @@ final class Guard {
             }
 
         case .staleRoute:
-            requestRouteFix()
+            _ = requestRouteFixAndWait("发现残留路由", wait: 6)
             cooldownUntil = Date().addingTimeInterval(20)
-            s.note = "已请求清残留路由"
+            s.note = "已清理残留路由"
 
         case .engineDead:
             launchClient()
