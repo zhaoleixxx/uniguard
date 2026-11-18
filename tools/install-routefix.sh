@@ -22,6 +22,10 @@ cat > /Library/LaunchDaemons/com.uniguard.routefix.plist <<'PLIST'
 </plist>
 PLIST
 
+# 清理旧 label（改名前的版本）
+launchctl bootout system/work.zhaolei.uniguard.routefix 2>/dev/null || true
+rm -f /Library/LaunchDaemons/work.zhaolei.uniguard.routefix.plist
+
 launchctl bootout system/com.uniguard.routefix 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/com.uniguard.routefix.plist 2>/dev/null || \
   launchctl load -w /Library/LaunchDaemons/com.uniguard.routefix.plist

@@ -440,6 +440,7 @@ final class Guard {
     func softRestart(_ reason: String) {
         act("重启客户端（\(reason)）")
         _ = Shell.sh("killall -9 UniVPN 2>/dev/null; sleep 2", timeout: 12)
+        _ = requestRouteFixAndWait("重启前清理", wait: 8)
         restoreProfileBeforeLaunch()
         launchClient()
         usleep(5_000_000)
@@ -465,9 +466,8 @@ final class Guard {
             if !guiRunning() && !engineAlive() { break }
             usleep(500_000)
         }
-        // ④ 趁机清掉残留路由（root 修复器立即响应）
-        try? Data().write(to: URL(fileURLWithPath: "/tmp/uniguard.routefix.trigger"))
-        usleep(3_000_000)
+        // ④ 清残留路由，并等到真正清完再启动
+        _ = requestRouteFixAndWait("兜底重启前清理", wait: 10)
         // ⑤ 把断线前的配置档写回去，再重新启动
         restoreProfileBeforeLaunch()
         launchClient()
@@ -482,6 +482,44 @@ final class Guard {
         lastFullRestart = Date()
         softRestarts = 0
         fullRestarts += 1
+    }
+
+    /// 只读扫描：是否存在指向已消失 utun 的路由
+    func deadUtunRoutes() -> [String] {
+        let live = Set(
+            Shell.sh("/sbin/ifconfig | awk '/^utun[0-9]+: flags/{print $1}' | tr -d ':'", timeout: 8).1
+                .split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }
+        )
+        var out: [String] = []
+        let rows = Shell.sh("/usr/sbin/netstat -rn -f inet", timeout: 10).1.split(separator: "\n")
+        for row in rows.dropFirst() {
+            let cols = row.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard let dst = cols.first, let ifc = cols.last, ifc.hasPrefix("utun") else { continue }
+            if !live.contains(ifc) { out.append("\(dst) -> \(ifc)") }
+        }
+        return out
+    }
+
+    /// 请求 root 修复器清理，并等到真的清干净（最多等 10 秒）
+    @discardableResult
+    func requestRouteFixAndWait(_ reason: String, wait: TimeInterval = 10) -> Bool {
+        lastRouteFixReq = Date()
+        let target = gateway.isEmpty ? "" : gateway
+        // 触发文件内容 = 目标网关，root 端按它优先清理
+        try? target.write(toFile: "/tmp/uniguard.routefix.trigger", atomically: true, encoding: .utf8)
+        log("请求清理残留存路由（目标网关 \(target.isEmpty ? "未知" : target)）：\(reason)")
+
+        let deadline = Date().addingTimeInterval(wait)
+        while Date() < deadline {
+            usleep(700_000)
+            if deadUtunRoutes().isEmpty {
+                log("残留路由已清空")
+                return true
+            }
+        }
+        let left = deadUtunRoutes()
+        log("残留路由仍存在：\(left.joined(separator: ", "))")
+        return false
     }
 
     private func requestRouteFix() {
@@ -573,6 +611,9 @@ final class Guard {
 
         case .dialTimeout:
             streak += 1
+            if streak >= 2 && Date().timeIntervalSince(lastRouteFixReq) > 90 {
+                _ = requestRouteFixAndWait("连不上第 \(streak) 次", wait: 8)
+            }
             if axBlocked {
                 // 点不动按钮：客户端重启后会自动登录，直接走这条路
                 if Date().timeIntervalSince(lastRestart) > 30 {

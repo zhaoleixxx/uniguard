@@ -10,12 +10,25 @@ fi
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
+# 触发文件里可以带"该清哪个网关"的提示（守护按当前配置档写入）
+GW_HINT=""
+take_trigger() {
+    [ -f /tmp/uniguard.routefix.trigger ] || return 1
+    H=$(tr -d '[:space:]' < /tmp/uniguard.routefix.trigger 2>/dev/null)
+    rm -f /tmp/uniguard.routefix.trigger 2>/dev/null
+    case "$H" in
+        *[!0-9.]*|"") ;;                     # 不是纯 IP 就忽略
+        *) GW_HINT="$H" ;;
+    esac
+    return 0
+}
+
 live_tuns() { /sbin/ifconfig 2>/dev/null | awk '/^utun[0-9]+: flags/ {print $1}' | tr -d ':' ; }
 
 fix_once() {
     LIVE=$(live_tuns)
-    # 1) 网关主机路由若指向不存在的 utun → 删除
-    for gw in $GW_LIST; do
+    # 1) 网关主机路由若指向不存在的 utun → 删除（先处理守护指定的那个档的网关）
+    for gw in $GW_HINT $GW_LIST; do
         IF=$(/sbin/route -n get "$gw" 2>/dev/null | awk '/interface:/{print $2}')
         case "$IF" in
             utun*)
@@ -41,12 +54,12 @@ fix_once() {
 
 log "routefix 启动"
 while :; do
-    fix_once
-    # 用户点「清理残留路由」时会创建触发文件，立即响应
-    if [ -f /tmp/uniguard.routefix.trigger ]; then
-        rm -f /tmp/uniguard.routefix.trigger
-        log "收到手动触发，执行清理"
+    if take_trigger; then
+        log "收到清理请求${GW_HINT:+（目标网关 $GW_HINT）}"
+        fix_once
+        GW_HINT=""
+    else
         fix_once
     fi
-    sleep 8
+    sleep 4
 done
